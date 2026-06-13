@@ -1,6 +1,6 @@
 use std::time::Duration;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tauri::Emitter;
@@ -26,8 +26,12 @@ enum ApiError {
     Timeout,
     #[error("Falha ao baixar o script de instalação")]
     DownloadFailed,
+    #[error("Erro ao buscar releases do GitHub")]
+    GithubError,
+    #[error("IP do PC na rede Haval não encontrado (192.168.33.x)")]
+    LocalIpNotFound,
     #[error("Erro de I/O: {0}")]
-    Io(#[from] std::io::Error), // Converte erros de IO automaticamente
+    Io(#[from] std::io::Error),
 }
 
 impl serde::Serialize for ApiError {
@@ -39,11 +43,16 @@ impl serde::Serialize for ApiError {
     }
 }
 
+#[derive(serde::Serialize, Clone)]
+pub struct ReleaseInfo {
+    tag_name: String,
+    download_url: String,
+}
+
 // Equivalente a: api.getGateaway
 #[tauri::command]
 async fn get_gateway() -> Result<String, ApiError> {
     let gateway = default_net::get_default_gateway().map_err(|_| ApiError::GatewayNotFound)?;
-
     Ok(gateway.ip_addr.to_string())
 }
 
@@ -67,7 +76,6 @@ async fn is_connected(state: tauri::State<'_, ConnectionState>) -> Result<bool, 
 // Equivalente a: api.connectToTelnet
 #[tauri::command]
 async fn connect_to_telnet(state: tauri::State<'_, ConnectionState>) -> Result<(), ApiError> {
-    // Bloqueia o acesso ao estado para modificá-lo
     let mut stream_lock = state.stream.lock().await;
 
     if stream_lock.is_some() {
@@ -76,15 +84,13 @@ async fn connect_to_telnet(state: tauri::State<'_, ConnectionState>) -> Result<(
     }
 
     let gateway = get_gateway().await?;
-    let addr = format!("{}:23", gateway); // Porta 23 é a padrão do Telnet
+    let addr = format!("{}:23", gateway);
 
     println!("Tentando conectar ao Telnet em {}...", addr);
     let stream = TcpStream::connect(&addr).await?;
     println!("Conexão estabelecida com sucesso!");
 
-    // Armazena a nova conexão no estado
     *stream_lock = Some(stream);
-
     Ok(())
 }
 
@@ -92,14 +98,10 @@ async fn connect_to_telnet(state: tauri::State<'_, ConnectionState>) -> Result<(
 #[tauri::command]
 async fn disconnect_from_telnet(state: tauri::State<'_, ConnectionState>) -> Result<(), ApiError> {
     let mut stream_lock = state.stream.lock().await;
-
-    // Ao substituir a conexão por `None`, a conexão antiga é "descartada" (dropped).
-    // Em Rust, quando um TcpStream é descartado, a conexão é fechada automaticamente.
     if stream_lock.is_some() {
         *stream_lock = None;
         println!("Conexão fechada!");
     }
-
     Ok(())
 }
 
@@ -109,46 +111,207 @@ async fn send_command(
     state: tauri::State<'_, ConnectionState>,
 ) -> Result<(), ApiError> {
     let mut stream_lock = state.stream.lock().await;
-
-    // Pega uma referência mutável para a stream dentro do estado
     if let Some(stream) = &mut *stream_lock {
         println!("Enviando comando: {}", command);
-        // Adiciona a quebra de linha `\n`, essencial para comandos de terminal
         let command_with_newline = format!("{}\n", command);
         stream.write_all(command_with_newline.as_bytes()).await?;
-        stream.flush().await?; // Garante que todos os dados foram enviados
+        stream.flush().await?;
     } else {
-        // Se não estiver conectado, retorna um erro.
-        // A lógica de reconexão automática pode ser complexa e é melhor
-        // ser controlada explicitamente pelo frontend.
         return Err(ApiError::NotConnected);
     }
-
     Ok(())
 }
 
-// Função helper para enviar comando e emitir evento
 async fn send_command_with_event(
     command: String,
     state: tauri::State<'_, ConnectionState>,
     app: &tauri::AppHandle,
 ) -> Result<(), ApiError> {
-    // Emite o comando sendo enviado
     let _ = app.emit("telnet-output", format!("$ {}", command));
-    
-    // Envia o comando normalmente
     send_command(command, state).await
+}
+
+// Busca as releases disponíveis do haval-app-tool-multimidia no GitHub
+#[tauri::command]
+async fn list_haval_releases() -> Result<Vec<ReleaseInfo>, ApiError> {
+    let client = reqwest::Client::builder()
+        .user_agent("haval-tool")
+        .build()
+        .map_err(|_| ApiError::GithubError)?;
+
+    let response: serde_json::Value = client
+        .get("https://api.github.com/repos/bobaoapae/haval-app-tool-multimidia/releases")
+        .send()
+        .await
+        .map_err(|_| ApiError::GithubError)?
+        .json()
+        .await
+        .map_err(|_| ApiError::GithubError)?;
+
+    let releases = response
+        .as_array()
+        .ok_or(ApiError::GithubError)?
+        .iter()
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?.to_string();
+            let assets = r["assets"].as_array()?;
+            let url = assets
+                .iter()
+                .find(|a| {
+                    a["name"]
+                        .as_str()
+                        .map(|n| n.ends_with(".apk"))
+                        .unwrap_or(false)
+                })?["browser_download_url"]
+                .as_str()?
+                .to_string();
+            Some(ReleaseInfo {
+                tag_name: tag,
+                download_url: url,
+            })
+        })
+        .take(15)
+        .collect();
+
+    Ok(releases)
+}
+
+// Desinstala o Haval App e o Shizuku do dispositivo
+#[tauri::command]
+async fn uninstall_apps(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionState>,
+) -> Result<(), ApiError> {
+    if !is_connected(state.clone()).await? {
+        return Err(ApiError::NotConnected);
+    }
+
+    let _ = app.emit("telnet-output", "🗑️ Desinstalando Haval App...");
+    send_command_with_event(
+        "pm uninstall br.com.redesurftank.havalshisuku".to_string(),
+        state.clone(),
+        &app,
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let _ = app.emit("telnet-output", "🗑️ Desinstalando Shizuku...");
+    send_command_with_event(
+        "pm uninstall moe.shizuku.privileged.api".to_string(),
+        state.clone(),
+        &app,
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let _ = app.emit("telnet-output", "✅ Desinstalação concluída!");
+    Ok(())
+}
+
+// Remove os arquivos temporários de /data/local/tmp do dispositivo
+#[tauri::command]
+async fn clean_tmp(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionState>,
+) -> Result<(), ApiError> {
+    if !is_connected(state.clone()).await? {
+        return Err(ApiError::NotConnected);
+    }
+
+    let _ = app.emit("telnet-output", "🧹 Limpando arquivos temporários...");
+    send_command_with_event(
+        "rm -f /data/local/tmp/fridaserver /data/local/tmp/fridainject /data/local/tmp/system_server.js /data/local/tmp/shizuku.apk /data/local/tmp/haval.apk /data/local/tmp/install.sh".to_string(),
+        state.clone(),
+        &app,
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let _ = app.emit("telnet-output", "✅ Arquivos temporários removidos!");
+    Ok(())
+}
+
+// Encontra o IP do PC na rede do Haval (192.168.33.x)
+fn find_haval_network_ip() -> Result<String, ApiError> {
+    let interfaces = default_net::get_interfaces();
+    for iface in &interfaces {
+        for addr in &iface.ipv4 {
+            let ip = addr.addr.to_string();
+            if ip.starts_with("192.168.33.") && ip != "192.168.33.1" {
+                return Ok(ip);
+            }
+        }
+    }
+    Err(ApiError::LocalIpNotFound)
+}
+
+// Serve um arquivo APK local via HTTP para que o carro possa baixar
+async fn serve_apk_file(mut stream: tokio::net::TcpStream, file_path: String) {
+    // Drena o cabeçalho HTTP recebido
+    let mut buf = vec![0u8; 4096];
+    let n = stream.read(&mut buf).await.unwrap_or(0);
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let is_head = request.starts_with("HEAD");
+
+    match tokio::fs::read(&file_path).await {
+        Ok(content) => {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/vnd.android.package-archive\r\nContent-Disposition: attachment; filename=\"haval.apk\"\r\nConnection: close\r\n\r\n",
+                content.len()
+            );
+            let _ = stream.write_all(headers.as_bytes()).await;
+            if !is_head {
+                let _ = stream.write_all(&content).await;
+            }
+            let _ = stream.flush().await;
+        }
+        Err(e) => {
+            let body = format!("Erro ao ler arquivo: {}", e);
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    }
+}
+
+// Inicia um servidor HTTP temporário que serve o APK local para o carro
+// Retorna a URL que o carro deve usar para baixar o APK
+#[tauri::command]
+async fn start_local_apk_server(file_path: String) -> Result<String, ApiError> {
+    let local_ip = find_haval_network_ip()?;
+
+    // Bind numa porta livre aleatória
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+    let port = listener.local_addr()?.port();
+
+    println!("Servidor APK local iniciado em {}:{}", local_ip, port);
+
+    // Roda em background até o app fechar
+    let fp = file_path.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = listener.accept().await {
+                println!("Conexão de {}", addr);
+                let file = fp.clone();
+                tokio::spawn(serve_apk_file(stream, file));
+            }
+        }
+    });
+
+    Ok(format!("http://{}:{}/haval.apk", local_ip, port))
 }
 
 // Equivalente a: api.injectScript
 #[tauri::command]
 async fn inject_script(
     app: tauri::AppHandle,
-    state: tauri::State<'_, ConnectionState>
+    state: tauri::State<'_, ConnectionState>,
+    haval_apk_url: Option<String>,
 ) -> Result<(), ApiError> {
-    // Download do script da URL sempre atualizada
     let client = reqwest::Client::new();
-    let install_script = client
+    let mut install_script = client
         .get("https://raw.githubusercontent.com/tontonhaval/haval-tool/refs/heads/main/install.sh")
         .send()
         .await
@@ -157,22 +320,38 @@ async fn inject_script(
         .await
         .map_err(|_| ApiError::DownloadFailed)?;
 
-    let install_script_escaped = install_script.split('\n').collect::<Vec<_>>().join("\\n");
+    // Se uma versão específica foi solicitada, substitui o download de latest pelo URL direto
+    if let Some(ref url) = haval_apk_url {
+        install_script = install_script.replace(
+            r#"$(get_latest_release "https://github.com/bobaoapae/haval-app-tool-multimidia")"#,
+            url,
+        );
 
-    let echo_command = format!(
-        r#"echo -e '{}' > /data/local/tmp/install.sh"#,
-        install_script_escaped
-    );
+        // Remove haval.apk cacheado para garantir download da versão/origem correta
+        let _ = app.emit("telnet-output", "🗑️ Removendo APK em cache...");
+        send_command_with_event(
+            "rm -f /data/local/tmp/haval.apk".to_string(),
+            state.clone(),
+            &app,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
     // Conecta-se caso ainda não esteja conectado
     if !is_connected(state.clone()).await? {
         connect_to_telnet(state.clone()).await?;
     }
 
-    // Emite eventos sobre o progresso
+    let install_script_escaped = install_script.split('\n').collect::<Vec<_>>().join("\\n");
+    let echo_command = format!(
+        r#"echo -e '{}' > /data/local/tmp/install.sh"#,
+        install_script_escaped
+    );
+
     let _ = app.emit("telnet-output", "📦 Enviando script para o dispositivo...");
     send_command_with_event(echo_command, state.clone(), &app).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await; // Equivalente a delay(2000)
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let _ = app.emit("telnet-output", "🔧 Definindo permissões de execução...");
     send_command_with_event(
@@ -195,17 +374,14 @@ async fn inject_script(
     Ok(())
 }
 
-// Função para monitorar output do telnet e emitir eventos
 #[tauri::command]
 async fn start_telnet_monitor(
     app: tauri::AppHandle,
     _state: tauri::State<'_, ConnectionState>,
 ) -> Result<(), ApiError> {
-    // Por enquanto, apenas informa que o monitoramento começou
     let _ = app.emit("telnet-output", "🚀 Monitor de telnet iniciado");
     let _ = app.emit("telnet-output", "📡 Conectado ao sistema telnet");
     let _ = app.emit("telnet-output", "⚡ Aguardando comandos e respostas...");
-    
     println!("Monitor de telnet iniciado (modo simplificado)");
     Ok(())
 }
@@ -216,37 +392,30 @@ async fn is_installed(
     app: tauri::AppHandle,
     state: tauri::State<'_, ConnectionState>
 ) -> Result<(), ApiError> {
-    // Esta função vai ouvir por uma resposta específica, com um timeout.
     let operation = async {
         let mut stream_lock = state.stream.lock().await;
 
         if let Some(stream) = stream_lock.as_mut() {
-            // BufReader nos ajuda a ler linhas de forma eficiente.
             let mut reader = BufReader::new(stream);
             let mut line_buffer = Vec::new();
 
             loop {
-                // Limpa o buffer antes de ler uma nova linha
                 line_buffer.clear();
 
-                // Lê uma linha da conexão de rede usando read_until para ser mais robusto
                 let bytes_read = reader.read_until(b'\n', &mut line_buffer).await?;
                 if bytes_read == 0 {
-                    // A conexão foi fechada pelo outro lado
                     return Err(ApiError::NotConnected);
                 }
 
-                // Tenta decodificar como UTF-8, ignora linhas com caracteres inválidos
                 let response = match String::from_utf8_lossy(&line_buffer).trim().to_lowercase() {
                     s if s.is_empty() => {
                         println!("Linha vazia ignorada");
-                        continue; // Ignora linhas vazias
+                        continue;
                     }
                     s => s.to_string(),
                 };
-                
+
                 println!("Resposta recebida: '{}'", response);
-                // Emite o output para o DebugModal
                 let _ = app.emit("telnet-output", response.clone());
 
                 if response == "fb5f2f27be2de104ac2b192f3e874dda" {
@@ -254,7 +423,6 @@ async fn is_installed(
                 } else if response == "fff66e9b3d962fa319c8068b5c1997cd" {
                     return Err(ApiError::RollbackDetected);
                 }
-                // Se não for nenhuma das respostas esperadas, o loop continua
             }
         } else {
             Err(ApiError::NotConnected)
@@ -262,19 +430,18 @@ async fn is_installed(
     };
 
     match tokio::time::timeout(Duration::from_secs(600), operation).await {
-        Ok(result) => result,             // A operação terminou a tempo
-        Err(_) => Err(ApiError::Timeout), // A operação demorou demais
+        Ok(result) => result,
+        Err(_) => Err(ApiError::Timeout),
     }
 }
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_log::Builder::new().build())
-        // 1. Inicializa o nosso estado e o disponibiliza para todos os comandos
         .manage(ConnectionState {
             stream: Arc::new(Mutex::new(None)),
         })
-        // 2. Registra todos os nossos comandos para que o frontend possa chamá-los
         .invoke_handler(tauri::generate_handler![
             get_gateway,
             is_haval_hotspot,
@@ -284,7 +451,11 @@ pub fn run() {
             is_connected,
             inject_script,
             is_installed,
-            start_telnet_monitor
+            start_telnet_monitor,
+            list_haval_releases,
+            uninstall_apps,
+            clean_tmp,
+            start_local_apk_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react"
 import { TerminalIcon } from "lucide-react"
 
 export type TeminalProps = {
@@ -8,6 +9,12 @@ export type TeminalProps = {
 }
 
 export const Terminal = ({ title, output, isConnecting = true, isExecuting = true }: TeminalProps) => {
+    const bottomRef = useRef<HTMLDivElement>(null)
+
+    useEffect(() => {
+        bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }, [output])
+
     return (
         <>
         <div className="flex items-center justify-between mb-4">
@@ -32,6 +39,7 @@ export const Terminal = ({ title, output, isConnecting = true, isExecuting = tru
             {(isConnecting || isExecuting) && (
               <div className="inline-block h-4 w-2 bg-green-500 animate-pulse ml-1"></div>
             )}
+            <div ref={bottomRef} />
           </div>
         </>
     )
