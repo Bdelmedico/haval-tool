@@ -312,7 +312,7 @@ async fn inject_script(
 ) -> Result<(), ApiError> {
     let client = reqwest::Client::new();
     let mut install_script = client
-        .get("https://raw.githubusercontent.com/tontonhaval/haval-tool/refs/heads/main/install.sh")
+        .get("https://raw.githubusercontent.com/Bdelmedico/haval-tool/refs/heads/main/install.sh")
         .send()
         .await
         .map_err(|_| ApiError::DownloadFailed)?

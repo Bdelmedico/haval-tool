@@ -2,7 +2,7 @@ export const Header = () => {
   return (
     <div className="w-full">
       <div
-        className="w-full h-48 md:h-56 lg:h-80 bg-cover bg-center relative"
+        className="w-full h-32 bg-cover bg-center relative"
         style={{
           backgroundImage:
             `url(/haval.jpg)`,
