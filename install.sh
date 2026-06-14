@@ -36,8 +36,8 @@ download() {
         sleep 5
         if [ -f "$2" ]; then
             local sz
-            sz=$(ls -la "$2" 2>/dev/null | awk '{print $5}')
-            log "INFO" "  Baixando $3: $((${sz:-0} / 1024)) KB recebidos..."
+            sz=$(wc -c < "$2" 2>/dev/null); sz=${sz:-0}
+            log "INFO" "  $3: $((sz / 1024)) KB recebidos..."
         else
             log "INFO" "  Baixando $3: aguardando resposta do servidor..."
         fi
@@ -45,8 +45,8 @@ download() {
     wait "$curl_pid" || die "Falha no download de $2"
     [ -f "$2" ] && [ -s "$2" ] || die "Arquivo $2 vazio apos download"
     local final
-    final=$(ls -la "$2" 2>/dev/null | awk '{print $5}')
-    log "INFO" "Download de $3 concluido! ($((${final:-0} / 1024)) KB)"
+    final=$(wc -c < "$2" 2>/dev/null); final=${final:-0}
+    log "INFO" "Download de $3 concluido! ($((final / 1024)) KB)"
 }
 
 # Instalacao de aplicativo
