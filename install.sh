@@ -63,14 +63,10 @@ main() {
     log "INFO" "Iniciando instalacao compacta..."
     cd . || die "Falha ao acessar diretorio"
 
-    # Desinstalacao e limpeza antes de instalar
-    log "INFO" "Fase 0: Desinstalando versoes anteriores..."
+    # Para o fridaserver se estiver rodando (sera reiniciado na fase 3)
+    log "INFO" "Fase 0: Preparando ambiente..."
     pkill -f fridaserver 2>/dev/null || true
-    pm uninstall br.com.redesurftank.havalshisuku 2>/dev/null || true
-    pm uninstall moe.shizuku.privileged.api 2>/dev/null || true
-    log "INFO" "Fase 0: Limpando arquivos temporarios..."
-    rm -f fridaserver fridainject system_server.js shizuku.apk haval.apk 2>/dev/null || true
-    log "INFO" "Fase 0: Limpeza concluida"
+    log "INFO" "Fase 0: Pronto"
 
     # Downloads
     log "INFO" "Fase 1: Downloads"
