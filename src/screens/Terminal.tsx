@@ -55,9 +55,9 @@ export const Terminal = () => {
     setIsExecuting(false)
 
     const setup = async () => {
-      const gateway = await invoke<string>('get_gateway')
-      setGatewayIp(gateway)
-      setOutput((prev: string[]) => [...prev, `Gateway: ${gateway}`])
+      const havalIp = await invoke<string>('find_haval_ip')
+      setGatewayIp(havalIp)
+      setOutput((prev: string[]) => [...prev, `IP do Haval: ${havalIp}`])
       setOutput((prev: string[]) => [...prev, `Modo: ${installMode === 'clean' ? 'Instalação Limpa' : 'Atualizar / Instalar'}`])
       setOutput((prev: string[]) => [...prev, `Versão: ${installVersion === 'latest' ? 'Mais recente (automático)' : installVersion.split('/').pop()?.replace('.apk', '') ?? installVersion}`])
 

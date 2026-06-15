@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::time::Duration;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -12,10 +13,8 @@ pub struct ConnectionState {
 
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
-    #[error("Não conectado ao hotspot do Haval (gateway {0} não inicia com '192.168.33.')")]
-    NotHavalHotspot(String),
-    #[error("Falha ao obter o gateway da rede")]
-    GatewayNotFound,
+    #[error("Não foi possível encontrar o Haval na rede (hotspot direto ou busca na rede local)")]
+    HavalNotFound,
     #[error("A conexão Telnet não está estabelecida")]
     NotConnected,
     #[error("Já está conectado")]
@@ -28,7 +27,7 @@ enum ApiError {
     DownloadFailed,
     #[error("Erro ao buscar releases do GitHub")]
     GithubError,
-    #[error("IP do PC na rede Haval não encontrado (192.168.33.x)")]
+    #[error("IP do PC na rede do Haval não encontrado")]
     LocalIpNotFound,
     #[error("Erro de I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -49,21 +48,69 @@ pub struct ReleaseInfo {
     download_url: String,
 }
 
-// Equivalente a: api.getGateaway
+// Tenta achar o IP do Haval na rede: primeiro pelo hotspot direto do carro
+// (gateway 192.168.33.x), senao escaneia a rede local procurando um host
+// com a porta 23 (telnet) aberta (ex: internet compartilhada do celular)
 #[tauri::command]
-async fn get_gateway() -> Result<String, ApiError> {
-    let gateway = default_net::get_default_gateway().map_err(|_| ApiError::GatewayNotFound)?;
-    Ok(gateway.ip_addr.to_string())
+async fn find_haval_ip() -> Result<String, ApiError> {
+    if let Ok(gateway) = default_net::get_default_gateway() {
+        let gw_ip = gateway.ip_addr.to_string();
+        if gw_ip.starts_with("192.168.33.") {
+            return Ok(gw_ip);
+        }
+    }
+
+    scan_for_haval_ip().await
+}
+
+// Escaneia as sub-redes locais (/24) procurando um host com a porta 23 (telnet) aberta
+async fn scan_for_haval_ip() -> Result<String, ApiError> {
+    let interfaces = default_net::get_interfaces();
+    let gateway_ip = default_net::get_default_gateway().ok().map(|g| g.ip_addr.to_string());
+
+    for iface in &interfaces {
+        for addr in &iface.ipv4 {
+            let ip = addr.addr;
+            if ip.is_loopback() || ip.is_link_local() {
+                continue;
+            }
+
+            let octets = ip.octets();
+            let mut tasks = Vec::new();
+
+            for host in 1u8..255 {
+                if host == octets[3] {
+                    continue;
+                }
+                let candidate = Ipv4Addr::new(octets[0], octets[1], octets[2], host);
+                if gateway_ip.as_deref() == Some(candidate.to_string().as_str()) {
+                    continue;
+                }
+                tasks.push(tokio::spawn(async move {
+                    let addr = format!("{}:23", candidate);
+                    tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(&addr))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .map(|_| candidate.to_string())
+                }));
+            }
+
+            for task in tasks {
+                if let Ok(Some(found)) = task.await {
+                    return Ok(found);
+                }
+            }
+        }
+    }
+
+    Err(ApiError::HavalNotFound)
 }
 
 // Equivalente a: api.isHavalHotspot
 #[tauri::command]
 async fn is_haval_hotspot() -> Result<(), ApiError> {
-    let gateway = get_gateway().await?;
-    if !gateway.starts_with("192.168.33.") {
-        return Err(ApiError::NotHavalHotspot(gateway));
-    }
-    Ok(())
+    find_haval_ip().await.map(|_| ())
 }
 
 // Equivalente a: api.isConnected
@@ -83,8 +130,8 @@ async fn connect_to_telnet(state: tauri::State<'_, ConnectionState>) -> Result<(
         return Err(ApiError::AlreadyConnected);
     }
 
-    let gateway = get_gateway().await?;
-    let addr = format!("{}:23", gateway);
+    let ip = find_haval_ip().await?;
+    let addr = format!("{}:23", ip);
 
     println!("Tentando conectar ao Telnet em {}...", addr);
     let stream = TcpStream::connect(&addr).await?;
@@ -231,14 +278,22 @@ async fn clean_tmp(
     Ok(())
 }
 
-// Encontra o IP do PC na rede do Haval (192.168.33.x)
-fn find_haval_network_ip() -> Result<String, ApiError> {
+// Encontra o IP do PC na mesma sub-rede (/24) do IP do Haval
+fn find_local_ip_in_subnet(haval_ip: &str) -> Result<String, ApiError> {
+    let target: Ipv4Addr = haval_ip.parse().map_err(|_| ApiError::LocalIpNotFound)?;
+    let target_octets = target.octets();
+
     let interfaces = default_net::get_interfaces();
     for iface in &interfaces {
         for addr in &iface.ipv4 {
-            let ip = addr.addr.to_string();
-            if ip.starts_with("192.168.33.") && ip != "192.168.33.1" {
-                return Ok(ip);
+            let ip = addr.addr;
+            let octets = ip.octets();
+            if octets[0] == target_octets[0]
+                && octets[1] == target_octets[1]
+                && octets[2] == target_octets[2]
+                && ip != target
+            {
+                return Ok(ip.to_string());
             }
         }
     }
@@ -280,7 +335,8 @@ async fn serve_apk_file(mut stream: tokio::net::TcpStream, file_path: String) {
 // Retorna a URL que o carro deve usar para baixar o APK
 #[tauri::command]
 async fn start_local_apk_server(file_path: String) -> Result<String, ApiError> {
-    let local_ip = find_haval_network_ip()?;
+    let haval_ip = find_haval_ip().await?;
+    let local_ip = find_local_ip_in_subnet(&haval_ip)?;
 
     // Bind numa porta livre aleatória
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
@@ -443,7 +499,7 @@ pub fn run() {
             stream: Arc::new(Mutex::new(None)),
         })
         .invoke_handler(tauri::generate_handler![
-            get_gateway,
+            find_haval_ip,
             is_haval_hotspot,
             connect_to_telnet,
             disconnect_from_telnet,

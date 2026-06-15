@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { AlertTriangleIcon, ArrowLeftIcon } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -8,26 +8,31 @@ export const Warning = () => {
   const [isChecking, setIsChecking] = useState(false)
   const [networkError, setNetworkError] = useState<string | null>(null)
   const navigate = useNavigate()
-  
+  const [searchParams] = useSearchParams()
+
+  const mode = searchParams.get('mode') || 'update'
+  const version = searchParams.get('version') || 'latest'
+
   const handleAcknowledge = () => {
     setAcknowledged(true)
     setNetworkError(null)
   }
-  
+
   const handleStart = async () => {
     setIsChecking(true)
     setNetworkError(null)
-    
+
     try {
-      // Verifica se está na rede Haval antes de navegar
       await invoke('is_haval_hotspot')
-      navigate('/install/terminal')
-    } catch (e: any) {  
+      const params = new URLSearchParams({ mode, version })
+      navigate(`/install/terminal?${params.toString()}`)
+    } catch (e: any) {
       setNetworkError(e.toString())
     } finally {
       setIsChecking(false)
     }
   }
+
   return (
     <div className="flex flex-col">
       <div className="flex-1 flex flex-col items-center justify-center p-6">
@@ -48,19 +53,37 @@ export const Warning = () => {
               seu dispositivo.
             </p>
           </div>
+
+          {/* Resumo da operação */}
+          <div className="bg-gray-800/50 border border-gray-600/50 rounded-xl px-4 py-3 mb-6 text-sm text-gray-300 space-y-1">
+            <p>
+              <span className="text-gray-500">Modo:</span>{' '}
+              <span className={mode === 'clean' ? 'text-red-300 font-medium' : 'text-blue-300 font-medium'}>
+                {mode === 'clean' ? 'Instalação Limpa (desinstala + reinstala)' : 'Atualizar / Instalar'}
+              </span>
+            </p>
+            <p>
+              <span className="text-gray-500">Versão:</span>{' '}
+              <span className="text-white font-medium">
+                {version === 'latest' ? 'Mais recente (automático)' : version.split('/').pop()?.replace('.apk', '') ?? version}
+              </span>
+            </p>
+          </div>
+
           {networkError && (
             <div className="bg-red-900/50 border border-red-500/50 text-red-100 px-4 py-3 rounded-xl mb-4">
               <p className="text-sm font-medium text-red-300 mb-2">Erro de Rede:</p>
               <p className="text-sm">{networkError}</p>
               <div className="mt-3 text-sm text-red-200">
                 <p className="font-medium">Para resolver:</p>
-                <p>1️⃣ Ative o hotspot no dispositivo Haval</p>
-                <p>2️⃣ Conecte este computador ao WiFi do Haval</p>
-                <p>3️⃣ Tente novamente</p>
+                <p>1️⃣ Ative o hotspot no dispositivo Haval e conecte este computador nele</p>
+                <p className="mt-1">— ou —</p>
+                <p>2️⃣ Conecte o Haval e este computador na mesma rede (ex: internet compartilhada do celular)</p>
+                <p className="mt-1">3️⃣ Tente novamente</p>
               </div>
             </div>
           )}
-          
+
           {!acknowledged ? (
             <button
               onClick={handleAcknowledge}
@@ -73,8 +96,8 @@ export const Warning = () => {
               onClick={handleStart}
               disabled={isChecking}
               className={`w-full text-center py-4 px-6 rounded-xl transition-all duration-300 font-medium ${
-                isChecking 
-                  ? 'bg-gray-600 text-gray-300 cursor-not-allowed' 
+                isChecking
+                  ? 'bg-gray-600 text-gray-300 cursor-not-allowed'
                   : 'bg-green-600 text-white hover:bg-green-700 shadow-lg hover:shadow-green-600/30'
               }`}
             >
