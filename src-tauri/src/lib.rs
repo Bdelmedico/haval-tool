@@ -13,8 +13,8 @@ pub struct ConnectionState {
 
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
-    #[error("Não foi possível encontrar o Haval na rede (hotspot direto ou busca na rede local)")]
-    HavalNotFound,
+    #[error("Não foi possível encontrar o Haval na rede (sub-redes testadas: {0})")]
+    HavalNotFound(String),
     #[error("A conexão Telnet não está estabelecida")]
     NotConnected,
     #[error("Já está conectado")]
@@ -63,12 +63,17 @@ async fn find_haval_ip() -> Result<String, ApiError> {
     scan_for_haval_ip().await
 }
 
-// Escaneia as sub-redes locais (/24) procurando um host com a porta 23 (telnet) aberta
+// Escaneia as sub-redes locais (/24) procurando um host com a porta 23 (telnet) aberta.
+// So considera interfaces com gateway configurado (rede "de verdade", ex: Wi-Fi),
+// ignorando adaptadores virtuais/host-only (VirtualBox, VPNs sem rota padrao, etc.)
 async fn scan_for_haval_ip() -> Result<String, ApiError> {
     let interfaces = default_net::get_interfaces();
-    let gateway_ip = default_net::get_default_gateway().ok().map(|g| g.ip_addr.to_string());
+    let mut scanned = Vec::new();
 
     for iface in &interfaces {
+        let Some(gateway) = &iface.gateway else { continue };
+        let gateway_ip = gateway.ip_addr.to_string();
+
         for addr in &iface.ipv4 {
             let ip = addr.addr;
             if ip.is_loopback() || ip.is_link_local() {
@@ -76,6 +81,7 @@ async fn scan_for_haval_ip() -> Result<String, ApiError> {
             }
 
             let octets = ip.octets();
+            scanned.push(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]));
             let mut tasks = Vec::new();
 
             for host in 1u8..255 {
@@ -83,12 +89,12 @@ async fn scan_for_haval_ip() -> Result<String, ApiError> {
                     continue;
                 }
                 let candidate = Ipv4Addr::new(octets[0], octets[1], octets[2], host);
-                if gateway_ip.as_deref() == Some(candidate.to_string().as_str()) {
+                if candidate.to_string() == gateway_ip {
                     continue;
                 }
                 tasks.push(tokio::spawn(async move {
                     let addr = format!("{}:23", candidate);
-                    tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(&addr))
+                    tokio::time::timeout(Duration::from_millis(400), TcpStream::connect(&addr))
                         .await
                         .ok()
                         .and_then(|r| r.ok())
@@ -104,7 +110,7 @@ async fn scan_for_haval_ip() -> Result<String, ApiError> {
         }
     }
 
-    Err(ApiError::HavalNotFound)
+    Err(ApiError::HavalNotFound(scanned.join(", ")))
 }
 
 // Equivalente a: api.isHavalHotspot
@@ -382,8 +388,18 @@ async fn inject_script(
             r#"$(get_latest_release "https://github.com/bobaoapae/haval-app-tool-multimidia")"#,
             url,
         );
+    }
 
-        // Remove haval.apk cacheado para garantir download da versão/origem correta
+    // Sempre reconecta para garantir conexão fresca (evita falhas por conexão morta/inativa)
+    let _ = app.emit("telnet-output", "🔌 Reconectando ao dispositivo...");
+    {
+        let mut stream_lock = state.stream.lock().await;
+        *stream_lock = None;
+    }
+    connect_to_telnet(state.clone()).await?;
+
+    // Remove haval.apk cacheado após reconectar (só quando URL específica fornecida)
+    if haval_apk_url.is_some() {
         let _ = app.emit("telnet-output", "🗑️ Removendo APK em cache...");
         send_command_with_event(
             "rm -f /data/local/tmp/haval.apk".to_string(),
@@ -392,11 +408,6 @@ async fn inject_script(
         )
         .await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-
-    // Conecta-se caso ainda não esteja conectado
-    if !is_connected(state.clone()).await? {
-        connect_to_telnet(state.clone()).await?;
     }
 
     let install_script_escaped = install_script.split('\n').collect::<Vec<_>>().join("\\n");
