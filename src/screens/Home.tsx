@@ -24,7 +24,7 @@ export const Home = () => {
           </div>
 
           <div className="mt-6 pt-5 border-t border-white/10 text-center">
-            <p className="text-xs text-gray-500">Melhorias por <span className="text-gray-400 font-medium">Bruno Medico</span></p>
+            <p className="text-xs text-gray-500">Melhorias por <span className="text-gray-400 font-medium">SnifferSp</span></p>
             <p className="text-xs text-blue-400 font-semibold tracking-wider mt-1">HAVALEIROS BRASIL</p>
           </div>
         </div>
